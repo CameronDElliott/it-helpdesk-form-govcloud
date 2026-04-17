@@ -1,0 +1,472 @@
+import { useState, useCallback, useRef, useEffect } from "react";
+
+const CATEGORIES = [
+  { id: "access", label: "🔐 Access Request", types: [
+    { id: "app_access", label: "Application / Tool Access" },
+    { id: "shared_mailbox_access", label: "Shared Mailbox or Distribution List Access" },
+    { id: "azure_access", label: "Azure / Cloud Resources" },
+    { id: "github_access", label: "GitHub Repository Access" },
+  ]},
+  { id: "new_resource", label: "🆕 New Resource Request", types: [
+    { id: "new_github_repo", label: "New GitHub Repository" },
+    { id: "new_shared_mailbox", label: "New Shared Mailbox" },
+    { id: "new_distribution_list", label: "New Distribution List / Group" },
+  ]},
+  { id: "issue", label: "🔧 IT Issue / Troubleshooting", types: [
+    { id: "it_issue", label: "General IT Problem" },
+  ]},
+];
+
+const FIELD_DEFS = {
+  app_access: [
+    { id: "app_name", label: "Application Name", placeholder: "e.g., GitHub, Azure DevOps, Salesforce, Claude, ChatGPT", required: true },
+    { id: "user_emails", label: "User Email(s)", placeholder: "email@armada.ai (comma-separate multiple)", required: true, autoPopulate: "email" },
+    { id: "access_level", label: "Access Level", type: "select", options: ["Read-only","Contributor","Admin","Unsure"], required: true },
+    { id: "justification", label: "Business Justification", type: "textarea", required: true },
+  ],
+  shared_mailbox_access: [
+    { id: "mailbox_email", label: "Mailbox / Group Email Address", placeholder: "e.g., sales@armada.ai", required: true },
+    { id: "access_type", label: "Access Type", type: "select", options: ["Full Access (read/send from mailbox)","Send As","Send on Behalf","DL Membership (receive emails)"], required: true },
+    { id: "user_emails", label: "User Email(s) Needing Access", placeholder: "email@armada.ai", required: true, autoPopulate: "email" },
+    { id: "justification", label: "Business Justification", type: "textarea", required: true },
+  ],
+  azure_access: [
+    { id: "resource_name", label: "Resource Name or URL", placeholder: "e.g., Azure group, subscription, Key Vault", required: true },
+    { id: "role_needed", label: "Role Needed", type: "select", options: ["Reader","Contributor","Owner","Other (specify in justification)"], required: true },
+    { id: "scope", label: "Scope", placeholder: "Subscription name or resource group", required: true },
+    { id: "justification", label: "Business Justification", type: "textarea", required: true },
+  ],
+  github_access: [
+    { id: "repo_name", label: "Repository Name or URL", required: true },
+    { id: "access_level", label: "Access Level", type: "select", options: ["Read","Triage","Write","Maintain","Admin"], required: true },
+    { id: "team", label: "Team to Add To (if known)", required: false },
+    { id: "justification", label: "Business Justification", type: "textarea", required: true },
+  ],
+  new_github_repo: [
+    { id: "repo_name", label: "Repository Name", placeholder: "proposed-repo-name", required: true },
+    { id: "visibility", label: "Visibility", type: "select", options: ["Private","Internal","Public"], required: true },
+    { id: "owners", label: "Owners / Team (emails or team name)", required: true },
+    { id: "description", label: "Description / Purpose", type: "textarea", required: true },
+    { id: "is_armadasystems", label: "Is this for the Armadasystems GitHub org?", type: "select", options: ["No — different org","Yes — Armadasystems org"], required: true },
+  ],
+  new_shared_mailbox: [
+    { id: "desired_email", label: "Desired Email Address", placeholder: "support-team@armada.ai", required: true },
+    { id: "display_name", label: "Display Name", required: true },
+    { id: "user_emails", label: "Users Who Need Access", placeholder: "Comma-separated emails", required: true, autoPopulate: "email" },
+    { id: "purpose", label: "Purpose", type: "textarea", required: true },
+  ],
+  new_distribution_list: [
+    { id: "desired_email", label: "Desired Email Address", required: true },
+    { id: "group_name", label: "Group Display Name", required: true },
+    { id: "members", label: "Initial Members", placeholder: "Comma-separated emails", required: true, autoPopulate: "email" },
+    { id: "send_permissions", label: "Who Can Send to This List", type: "select", options: ["Everyone","Members only","Specific senders (list in purpose)"], required: true },
+    { id: "purpose", label: "Purpose", type: "textarea", required: true },
+  ],
+  it_issue: [
+    { id: "description", label: "What's Happening?", type: "textarea", required: true },
+    { id: "started", label: "When Did It Start?", required: true },
+    { id: "tried", label: "What Have You Tried?", placeholder: "Restart, reinstall, etc.", type: "textarea", required: false },
+    { id: "error_msg", label: "Error Message (if any)", type: "textarea", required: false },
+    { id: "urgency", label: "Urgency", type: "select", options: ["Blocking my work — need help ASAP","Impacting my work but I can partially continue","Low — can wait a few days"], required: true },
+  ],
+};
+
+function formatFileSize(bytes) {
+  if (bytes < 1024) return bytes + " B";
+  if (bytes < 1048576) return (bytes / 1024).toFixed(1) + " KB";
+  return (bytes / 1048576).toFixed(1) + " MB";
+}
+
+function getFileIcon(type) {
+  if (type.startsWith("image/")) return "🖼️";
+  if (type.includes("pdf")) return "📄";
+  if (type.includes("spreadsheet") || type.includes("excel") || type.includes("csv")) return "📊";
+  if (type.includes("word") || type.includes("document")) return "📝";
+  if (type.includes("zip") || type.includes("compressed")) return "📦";
+  if (type.includes("text")) return "📃";
+  return "📎";
+}
+
+async function detectCurrentUser() {
+  try {
+    const ctx = window._spPageContextInfo;
+    if (ctx) return { name: ctx.userDisplayName || "", email: ctx.userEmail || ctx.userLoginName || "" };
+  } catch (_) {}
+  try {
+    const spRes = await fetch("/_api/web/currentuser?$select=Title,Email,LoginName", {
+      headers: { Accept: "application/json;odata=verbose" }, credentials: "include",
+    });
+    if (spRes.ok) { const u = (await spRes.json()).d; return { name: u.Title || "", email: u.Email || u.LoginName || "" }; }
+  } catch (_) {}
+  try {
+    const graphRes = await fetch("https://graph.microsoft.com/v1.0/me?$select=displayName,mail,userPrincipalName", { credentials: "include" });
+    if (graphRes.ok) { const u = await graphRes.json(); return { name: u.displayName || "", email: u.mail || u.userPrincipalName || "" }; }
+  } catch (_) {}
+  return { name: "", email: "" };
+}
+
+function buildSubject(typeId, fields) {
+  const m = {
+    app_access: () => `Access Request: ${fields.app_name || ""}`,
+    shared_mailbox_access: () => `Shared Mailbox Access: ${fields.mailbox_email || ""}`,
+    azure_access: () => `Azure Access Request: ${fields.resource_name || ""}`,
+    github_access: () => `GitHub Access Request: ${fields.repo_name || ""}`,
+    new_github_repo: () => `New GitHub Repository Request: ${fields.repo_name || ""}`,
+    new_shared_mailbox: () => `New Shared Mailbox Request: ${fields.desired_email || ""}`,
+    new_distribution_list: () => `New Distribution List Request: ${fields.desired_email || ""}`,
+    it_issue: () => `IT Issue: ${(fields.description || "").substring(0, 50)}`,
+  };
+  return `GOV CLOUD: ${(m[typeId] || (() => "Helpdesk Request"))()}`;
+}
+
+function buildBody(typeId, fields, fieldDefs, requesterName, files, managerEmail) {
+  let lines = ["Hi Team,", ""];
+  if (managerEmail) {
+    lines.push(`Manager (CC'd for approval): ${managerEmail}`, "");
+  }
+  if (typeId === "new_github_repo" && fields.is_armadasystems === "Yes — Armadasystems org") {
+    lines.push("NOTE: This is for the Armadasystems GitHub org. I understand I should use the ASE Form instead:");
+    lines.push("https://dev.azure.com/armadasystems/Commander/_wiki/wikis/Commander.wiki/193/New-Repository-and-ASE-Service");
+    lines.push("", "Submitting here in case additional IT assistance is needed.", "");
+  }
+  fieldDefs.forEach(f => {
+    if (f.id === "is_armadasystems") return;
+    const val = fields[f.id];
+    if (val) lines.push(`${f.label}: ${val}`);
+  });
+  if (files.length > 0) {
+    lines.push("", `Attachments (${files.length}):`);
+    files.forEach((f, i) => lines.push(`  ${i + 1}. ${f.name} (${formatFileSize(f.size)})`));
+    lines.push("", "⚠️ Please see attached files on this email.");
+  }
+  lines.push("", "Thanks,", requesterName || "[Your name]");
+  return lines.join("\n");
+}
+
+const inputStyle = {
+  width: "100%", padding: "10px 12px", border: "1px solid #d1d5db", borderRadius: "6px",
+  fontSize: "14px", fontFamily: "inherit", background: "#fff", outline: "none", transition: "border-color 0.15s",
+};
+const labelStyle = { display: "block", fontWeight: 600, marginBottom: "4px", fontSize: "14px", color: "#1D2A33" };
+const reqDot = { color: "#dc2626", marginLeft: "2px" };
+
+function FileUploader({ files, setFiles }) {
+  const fileInputRef = useRef(null);
+  const [dragOver, setDragOver] = useState(false);
+  const MAX_FILES = 10;
+  const MAX_SIZE = 25 * 1024 * 1024;
+  const addFiles = (newFiles) => {
+    const incoming = Array.from(newFiles); const valid = []; const errs = [];
+    incoming.forEach(f => {
+      if (files.length + valid.length >= MAX_FILES) { errs.push(`${f.name}: max ${MAX_FILES} files`); return; }
+      if (f.size > MAX_SIZE) { errs.push(`${f.name}: exceeds 25 MB limit`); return; }
+      if (files.some(ex => ex.name === f.name && ex.size === f.size)) { errs.push(`${f.name}: already added`); return; }
+      valid.push(f);
+    });
+    if (valid.length) setFiles(prev => [...prev, ...valid]);
+    if (errs.length) alert(errs.join("\n"));
+  };
+  const removeFile = (idx) => setFiles(prev => prev.filter((_, i) => i !== idx));
+  return (
+    <div style={{ marginBottom: 20 }}>
+      <label style={labelStyle}>Attachments</label>
+      <p style={{ fontSize: 13, color: "#666", margin: "0 0 8px 0" }}>Screenshots, error messages, approval emails, etc. (max 10 files, 25 MB each)</p>
+      <div onClick={() => fileInputRef.current?.click()}
+        onDrop={e => { e.preventDefault(); setDragOver(false); if (e.dataTransfer.files.length) addFiles(e.dataTransfer.files); }}
+        onDragOver={e => { e.preventDefault(); setDragOver(true); }} onDragLeave={() => setDragOver(false)}
+        style={{ border: `2px dashed ${dragOver ? "#1D2A33" : "#d1d5db"}`, borderRadius: 8, padding: "24px 16px", textAlign: "center", cursor: "pointer", background: dragOver ? "#e8f1f5" : "#fafafa", transition: "all 0.15s" }}>
+        <div style={{ fontSize: 28, marginBottom: 6 }}>📎</div>
+        <div style={{ fontSize: 14, fontWeight: 600, color: "#1D2A33" }}>Click to browse or drag & drop files here</div>
+        <div style={{ fontSize: 12, color: "#888", marginTop: 4 }}>Images, PDFs, documents, spreadsheets, and more</div>
+        <input ref={fileInputRef} type="file" multiple style={{ display: "none" }} onChange={e => { if (e.target.files.length) addFiles(e.target.files); e.target.value = ""; }} />
+      </div>
+      {files.length > 0 && (
+        <div style={{ marginTop: 10 }}>
+          {files.map((f, i) => (
+            <div key={`${f.name}-${f.size}-${i}`} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 12px", background: "#f8f9fa", border: "1px solid #e5e7eb", borderRadius: 6, marginBottom: 6 }}>
+              <span style={{ fontSize: 20, flexShrink: 0 }}>{getFileIcon(f.type)}</span>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 13, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.name}</div>
+                <div style={{ fontSize: 11, color: "#888" }}>{formatFileSize(f.size)}</div>
+              </div>
+              {f.type.startsWith("image/") && <img src={URL.createObjectURL(f)} alt="" style={{ width: 36, height: 36, objectFit: "cover", borderRadius: 4, flexShrink: 0 }} />}
+              <button onClick={e => { e.stopPropagation(); removeFile(i); }} style={{ width: 28, height: 28, borderRadius: "50%", border: "none", background: "#fee2e2", color: "#dc2626", cursor: "pointer", fontSize: 14, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, fontFamily: "inherit" }} title="Remove file">×</button>
+            </div>
+          ))}
+          <div style={{ fontSize: 12, color: "#888", marginTop: 4 }}>{files.length}/{MAX_FILES} files</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function IdentityBadge({ status, email }) {
+  const cfg = {
+    loading: { bg: "#f0f4f8", border: "#d1d5db", color: "#666", text: "⏳ Detecting your account…" },
+    success: { bg: "#d1fae5", border: "#34d399", color: "#065f46", text: `✅ Signed in as ${email}` },
+    failed:  { bg: "#fef3c7", border: "#f59e0b", color: "#92400e", text: "ℹ️ Could not detect your account — please fill in manually" },
+  };
+  const c = cfg[status]; if (!c) return null;
+  return <div style={{ background: c.bg, border: `1px solid ${c.border}`, borderRadius: 6, padding: "8px 14px", fontSize: 13, color: c.color, marginBottom: 20, display: "flex", alignItems: "center", gap: 8 }}>{c.text}</div>;
+}
+
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+export default function HelpdeskForm() {
+  const [category, setCategory] = useState("");
+  const [requestType, setRequestType] = useState("");
+  const [fields, setFields] = useState({});
+  const [requesterName, setRequesterName] = useState("");
+  const [managerEmail, setManagerEmail] = useState("");
+  const [files, setFiles] = useState([]);
+  const [submitted, setSubmitted] = useState(false);
+  const [errors, setErrors] = useState({});
+  const [copyLabel, setCopyLabel] = useState("📋 Copy to Clipboard");
+  const [detectedUser, setDetectedUser] = useState({ name: "", email: "" });
+  const [identityStatus, setIdentityStatus] = useState("loading");
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const user = await detectCurrentUser();
+        if (cancelled) return;
+        if (user.email) { setDetectedUser(user); setRequesterName(prev => prev || user.name); setIdentityStatus("success"); }
+        else setIdentityStatus("failed");
+      } catch { if (!cancelled) setIdentityStatus("failed"); }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const currentTypes = CATEGORIES.find(c => c.id === category)?.types || [];
+  const currentFields = FIELD_DEFS[requestType] || [];
+
+  useEffect(() => {
+    if (!requestType || !detectedUser.email) return;
+    const defs = FIELD_DEFS[requestType] || [];
+    const auto = {};
+    defs.forEach(f => { if (f.autoPopulate === "email") auto[f.id] = detectedUser.email; });
+    if (Object.keys(auto).length) setFields(prev => {
+      const m = { ...prev }; Object.entries(auto).forEach(([k, v]) => { if (!m[k]) m[k] = v; }); return m;
+    });
+  }, [requestType, detectedUser.email]);
+
+  const handleCategoryChange = (val) => { setCategory(val); setRequestType(""); setFields({}); setErrors({}); setSubmitted(false); setFiles([]); };
+  const handleTypeChange = (val) => { setRequestType(val); setFields({}); setErrors({}); setSubmitted(false); setFiles([]); };
+  const setField = (id, val) => { setFields(prev => ({ ...prev, [id]: val })); if (errors[id]) setErrors(prev => { const n = { ...prev }; delete n[id]; return n; }); };
+
+  const validate = () => {
+    const errs = {};
+    if (!requesterName.trim()) errs._name = true;
+    if (!managerEmail.trim()) errs._manager = "required";
+    else if (!EMAIL_REGEX.test(managerEmail.trim())) errs._manager = "invalid";
+    currentFields.forEach(f => { if (f.required && !fields[f.id]?.toString().trim()) errs[f.id] = true; });
+    setErrors(errs);
+    return Object.keys(errs).length === 0;
+  };
+
+  const subject = buildSubject(requestType, fields);
+  const body = buildBody(requestType, fields, currentFields, requesterName, files, managerEmail);
+  const handleSubmit = () => { if (!validate()) return; setSubmitted(true); };
+  const mailtoLink = `mailto:helpdesk@armada.ai?cc=${encodeURIComponent(managerEmail)}&subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+  const handleCopy = useCallback(() => {
+    const full = `Subject: ${subject}\n\n${body}`;
+    navigator.clipboard.writeText(full).then(() => { setCopyLabel("✅ Copied!"); setTimeout(() => setCopyLabel("📋 Copy to Clipboard"), 2000); }).catch(() => {});
+  }, [subject, body]);
+  const handleReset = () => { setCategory(""); setRequestType(""); setFields({}); setRequesterName(detectedUser.name || ""); setManagerEmail(""); setFiles([]); setSubmitted(false); setErrors({}); setCopyLabel("📋 Copy to Clipboard"); };
+
+  const showAseWarning = requestType === "new_github_repo" && fields.is_armadasystems === "Yes — Armadasystems org";
+
+  return (
+    <div style={{ maxWidth: 720, margin: "0 auto", fontFamily: "'Segoe UI', -apple-system, sans-serif", color: "#1a1a1a" }}>
+      {/* Header */}
+      <div style={{ background: "#1D2A33", color: "#fff", padding: "28px 32px", borderRadius: "12px 12px 0 0" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 4 }}>
+          <svg width="36" height="36" viewBox="0 0 32 32" fill="none"><rect width="32" height="32" rx="4.5" fill="#fff"/><path d="M15.9499 23.332C16.0331 18.5009 16.114 13.8211 16.195 9.10932C17.9468 8.33815 19.6618 7.5832 21.6235 6.71943C21.1217 12.4017 22.911 17.1658 26.9792 21.3031C23.28 21.9837 19.6981 22.6424 15.9499 23.332ZM14.9674 8.04622C9.2091 10.8667 5.77205 18.0881 7.19236 23.8102C9.00093 22.9809 10.7952 22.158 12.6704 21.2979C11.352 16.6143 12.0227 12.2442 14.9674 8.04622Z" fill="#1D2A33"/></svg>
+          <h1 style={{ fontSize: 24, margin: 0, fontWeight: 700 }}>GOV CLOUD IT Helpdesk Request</h1>
+        </div>
+        <p style={{ margin: 0, opacity: 0.85, fontSize: 14 }}>Fill in the form below and we'll compose the email for you. The more detail, the faster we can help.</p>
+      </div>
+
+      <div style={{ background: "#fff", border: "1px solid #e5e7eb", borderTop: "none", borderRadius: "0 0 12px 12px", padding: "28px 32px" }}>
+        {/* Manager Approval Notice - mandatory read before submitting */}
+        <div style={{ background: "#fee2e2", border: "2px solid #dc2626", borderRadius: 8, padding: "16px 18px", marginBottom: 20 }}>
+          <div style={{ fontSize: 15, fontWeight: 700, color: "#991b1b", marginBottom: 6 }}>
+            ⚠️ Manager approval required before submitting
+          </div>
+          <div style={{ fontSize: 13, color: "#7f1d1d", lineHeight: 1.5 }}>
+            All GovCloud tickets require manager sign-off <em>before</em> submission. You must confirm approval with your manager first — their email will be CC'd on this ticket so they can confirm the request. Tickets submitted without prior manager approval will be placed on hold.
+          </div>
+        </div>
+
+        <IdentityBadge status={identityStatus} email={detectedUser.email} />
+
+        {!submitted ? (
+          <>
+            {/* Your Name */}
+            <div style={{ marginBottom: 20 }}>
+              <label style={labelStyle}>Your Name<span style={reqDot}>*</span></label>
+              <input style={{ ...inputStyle, borderColor: errors._name ? "#dc2626" : "#d1d5db" }}
+                value={requesterName} onChange={e => { setRequesterName(e.target.value); if (errors._name) setErrors(p => { const n = { ...p }; delete n._name; return n; }); }}
+                placeholder="First Last" />
+              {errors._name && <span style={{ color: "#dc2626", fontSize: 12 }}>Required</span>}
+              {identityStatus === "success" && requesterName === detectedUser.name && <span style={{ fontSize: 12, color: "#065f46" }}> Auto-filled from your account</span>}
+            </div>
+
+            {/* Manager Email - required, CC'd on ticket */}
+            <div style={{ marginBottom: 20 }}>
+              <label style={labelStyle}>Manager's Email<span style={reqDot}>*</span></label>
+              <input type="email" style={{ ...inputStyle, borderColor: errors._manager ? "#dc2626" : "#d1d5db" }}
+                value={managerEmail}
+                onChange={e => { setManagerEmail(e.target.value); if (errors._manager) setErrors(p => { const n = { ...p }; delete n._manager; return n; }); }}
+                placeholder="manager@armada.ai" />
+              <span style={{ fontSize: 12, color: "#666", display: "block", marginTop: 4 }}>
+                Your manager will be CC'd on this ticket. Confirm approval with them before submitting.
+              </span>
+              {errors._manager === "required" && <span style={{ color: "#dc2626", fontSize: 12 }}>Required</span>}
+              {errors._manager === "invalid" && <span style={{ color: "#dc2626", fontSize: 12 }}>Enter a valid email address</span>}
+            </div>
+
+            {/* Category */}
+            <div style={{ marginBottom: 20 }}>
+              <label style={labelStyle}>Request Category<span style={reqDot}>*</span></label>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                {CATEGORIES.map(c => (
+                  <button key={c.id} onClick={() => handleCategoryChange(c.id)}
+                    style={{ padding: "14px 16px", borderRadius: 8, border: category === c.id ? "2px solid #1D2A33" : "1px solid #d1d5db", background: category === c.id ? "#e8f1f5" : "#fafafa", cursor: "pointer", fontWeight: category === c.id ? 700 : 500, fontSize: 14, textAlign: "left", fontFamily: "inherit", transition: "all 0.15s" }}>
+                    {c.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Request Type */}
+            {category && (
+              <div style={{ marginBottom: 20 }}>
+                <label style={labelStyle}>Request Type<span style={reqDot}>*</span></label>
+                <select style={{ ...inputStyle, cursor: "pointer" }} value={requestType} onChange={e => handleTypeChange(e.target.value)}>
+                  <option value="">— Select —</option>
+                  {currentTypes.map(t => <option key={t.id} value={t.id}>{t.label}</option>)}
+                </select>
+              </div>
+            )}
+
+            {/* ASE Warning */}
+            {showAseWarning && (
+              <div style={{ background: "#fef3c7", border: "1px solid #f59e0b", borderRadius: 8, padding: "14px 18px", marginBottom: 20 }}>
+                <strong>⚠️ Armadasystems Org Repos</strong> should be requested via the <a href="https://dev.azure.com/armadasystems/Commander/_wiki/wikis/Commander.wiki/193/New-Repository-and-ASE-Service" target="_blank" rel="noopener" style={{ color: "#1D2A33", fontWeight: 700 }}>ASE Form</a>. You may still proceed here if you need additional IT help.
+              </div>
+            )}
+
+            {/* Dynamic Fields */}
+            {requestType && currentFields.map(f => {
+              const isAutoFilled = f.autoPopulate === "email" && identityStatus === "success" && fields[f.id] === detectedUser.email;
+              return (
+                <div key={f.id} style={{ marginBottom: 18 }}>
+                  <label style={labelStyle}>{f.label}{f.required && <span style={reqDot}>*</span>}</label>
+                  {f.type === "select" ? (
+                    <select style={{ ...inputStyle, cursor: "pointer", borderColor: errors[f.id] ? "#dc2626" : "#d1d5db" }}
+                      value={fields[f.id] || ""} onChange={e => setField(f.id, e.target.value)}>
+                      <option value="">— Select —</option>
+                      {f.options.map(o => <option key={o} value={o}>{o}</option>)}
+                    </select>
+                  ) : f.type === "textarea" ? (
+                    <textarea rows={3} style={{ ...inputStyle, resize: "vertical", borderColor: errors[f.id] ? "#dc2626" : "#d1d5db" }}
+                      value={fields[f.id] || ""} onChange={e => setField(f.id, e.target.value)} placeholder={f.placeholder || ""} />
+                  ) : f.type === "date" ? (
+                    <input type="date" style={{ ...inputStyle, borderColor: errors[f.id] ? "#dc2626" : "#d1d5db" }}
+                      value={fields[f.id] || ""} onChange={e => setField(f.id, e.target.value)} />
+                  ) : f.type === "number" ? (
+                    <input type="number" step="0.01" min="0" style={{ ...inputStyle, borderColor: errors[f.id] ? "#dc2626" : "#d1d5db" }}
+                      value={fields[f.id] || ""} onChange={e => setField(f.id, e.target.value)} placeholder={f.placeholder || ""} />
+                  ) : (
+                    <input type="text" style={{ ...inputStyle, borderColor: errors[f.id] ? "#dc2626" : "#d1d5db" }}
+                      value={fields[f.id] || ""} onChange={e => setField(f.id, e.target.value)} placeholder={f.placeholder || ""} />
+                  )}
+                  {errors[f.id] && <span style={{ color: "#dc2626", fontSize: 12 }}>Required</span>}
+                  {isAutoFilled && <span style={{ fontSize: 12, color: "#065f46" }}> Auto-filled from your account</span>}
+                </div>
+              );
+            })}
+
+            {/* File Upload */}
+            {requestType && <FileUploader files={files} setFiles={setFiles} />}
+
+            {/* Submit */}
+            {requestType && (
+              <button onClick={handleSubmit}
+                style={{ width: "100%", padding: "14px", background: "#1D2A33", color: "#fff", border: "none", borderRadius: 8, fontSize: 16, fontWeight: 700, cursor: "pointer", fontFamily: "inherit", marginTop: 8, transition: "opacity 0.15s" }}
+                onMouseEnter={e => e.target.style.opacity = 0.9} onMouseLeave={e => e.target.style.opacity = 1}>
+                Generate Email →
+              </button>
+            )}
+          </>
+        ) : (
+          <>
+            <div style={{ background: "#d1fae5", border: "1px solid #34d399", borderRadius: 8, padding: "14px 18px", marginBottom: 24, display: "flex", alignItems: "center", gap: 10 }}>
+              <span style={{ fontSize: 22 }}>✅</span>
+              <div><strong>Email ready!</strong> Open it in your mail client or copy the text below.</div>
+            </div>
+
+            {files.length > 0 && (
+              <div style={{ background: "#fef3c7", border: "1px solid #f59e0b", borderRadius: 8, padding: "14px 18px", marginBottom: 20, display: "flex", alignItems: "flex-start", gap: 10 }}>
+                <span style={{ fontSize: 18, flexShrink: 0, marginTop: 1 }}>📎</span>
+                <div>
+                  <strong>Don't forget your attachments!</strong>
+                  <p style={{ margin: "4px 0 0", fontSize: 13, color: "#92400e" }}>
+                    Your mail client will open with the email body pre-filled. Please manually attach the {files.length} file{files.length > 1 ? "s" : ""} listed below before sending.
+                  </p>
+                  <div style={{ marginTop: 8 }}>
+                    {files.map((f, i) => (
+                      <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, marginBottom: 3 }}>
+                        <span>{getFileIcon(f.type)}</span>
+                        <span style={{ fontWeight: 600 }}>{f.name}</span>
+                        <span style={{ color: "#92400e" }}>({formatFileSize(f.size)})</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            <div style={{ marginBottom: 8 }}>
+              <label style={{ ...labelStyle, fontSize: 12, textTransform: "uppercase", letterSpacing: "0.05em", color: "#666" }}>To</label>
+              <div style={{ fontSize: 15, fontWeight: 600 }}>helpdesk@armada.ai</div>
+            </div>
+            <div style={{ marginBottom: 8 }}>
+              <label style={{ ...labelStyle, fontSize: 12, textTransform: "uppercase", letterSpacing: "0.05em", color: "#666" }}>CC (Manager)</label>
+              <div style={{ fontSize: 15, fontWeight: 600 }}>{managerEmail}</div>
+            </div>
+            <div style={{ marginBottom: 8 }}>
+              <label style={{ ...labelStyle, fontSize: 12, textTransform: "uppercase", letterSpacing: "0.05em", color: "#666" }}>Subject</label>
+              <div style={{ fontSize: 15, fontWeight: 600 }}>{subject}</div>
+            </div>
+            <div style={{ marginBottom: 20 }}>
+              <label style={{ ...labelStyle, fontSize: 12, textTransform: "uppercase", letterSpacing: "0.05em", color: "#666" }}>Body</label>
+              <pre style={{ background: "#f8f9fa", border: "1px solid #e0e0e0", borderRadius: 8, padding: 18, fontFamily: "'Segoe UI', sans-serif", fontSize: 14, whiteSpace: "pre-wrap", lineHeight: 1.6 }}>{body}</pre>
+            </div>
+
+            <div style={{ display: "flex", gap: 12 }}>
+              <a href={mailtoLink} style={{ flex: 1, display: "inline-flex", alignItems: "center", justifyContent: "center", padding: "14px", background: "#1D2A33", color: "#fff", borderRadius: 8, fontSize: 15, fontWeight: 700, textDecoration: "none", transition: "opacity 0.15s" }}
+                onMouseEnter={e => e.currentTarget.style.opacity = 0.9} onMouseLeave={e => e.currentTarget.style.opacity = 1}>
+                📧 Open in Mail Client
+              </a>
+              <button onClick={handleCopy} style={{ flex: 1, padding: "14px", background: "#fff", color: "#1D2A33", border: "2px solid #1D2A33", borderRadius: 8, fontSize: 15, fontWeight: 700, cursor: "pointer", fontFamily: "inherit", transition: "background 0.15s" }}
+                onMouseEnter={e => e.target.style.background = "#f0f4f8"} onMouseLeave={e => e.target.style.background = "#fff"}>
+                {copyLabel}
+              </button>
+            </div>
+
+            <button onClick={handleReset} style={{ width: "100%", marginTop: 16, padding: "10px", background: "transparent", color: "#666", border: "1px solid #d1d5db", borderRadius: 8, fontSize: 14, cursor: "pointer", fontFamily: "inherit" }}>
+              ← Start a new request
+            </button>
+          </>
+        )}
+      </div>
+
+      <div style={{ textAlign: "center", marginTop: 16, fontSize: 13, color: "#888" }}>
+        IT Helpdesk • helpdesk@armada.ai • Teams: Search "IT Helpdesk"
+      </div>
+    </div>
+  );
+}
